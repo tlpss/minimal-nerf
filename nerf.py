@@ -1,4 +1,5 @@
 from dis import dis
+from random import shuffle
 from turtle import distance
 from typing import Tuple
 from unittest import TestResult
@@ -8,6 +9,7 @@ import pytorch_lightning as pl
 import numpy as np
 import torch.random 
 import wandb 
+from pytorch_lightning.loggers import WandbLogger
 
 class NeRFNetwork(nn.Module):
     def __init__(self, depth=2, width=256, skips=[]):
@@ -75,8 +77,8 @@ class NeRF(pl.LightningModule):
 
     
     def render_view(self,camera_pose, height, width,focal_distance):
-        rays_origin, rays_direction = get_image_rays(camera_pose,height,width,focal_distance, device=self.device)
-        rendered_rgbs = self.render_rays(rays_origin.flatten(),rays_direction.flatten(),self.n_coarse_samples)
+        rays_origin, rays_direction = get_image_rays(camera_pose.cpu(),height,width,focal_distance, device=self.device)
+        rendered_rgbs = self.render_rays(rays_origin.flatten(end_dim=-2),rays_direction.flatten(end_dim=-2),self.n_coarse_samples)
         rendered_img = rendered_rgbs.reshape(rays_origin.shape)
         return rendered_img
 
@@ -178,7 +180,17 @@ class NeRF(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        pass
+        image, pose, focal_length = batch
+        image = image[0]
+        pose = pose[0]
+        focal_length = focal_length.item()
+        with torch.no_grad():
+            rendered_image = self.render_view(pose,image.shape[0],image.shape[1],focal_length)
+            rendered_image = rendered_image.cpu().numpy()
+
+        if isinstance(self.logger, WandbLogger):
+            self.logger.log_image(key=f"train_{batch_idx}", images =[rendered_image], caption=[f"train_{batch_idx}"])
+
 
 
     def configure_optimizers(self):
@@ -212,7 +224,7 @@ def get_image_rays(camera_pose: torch.Tensor, H:int, W:int, focal_distance:float
     rays_d = rays_d / direction_norm.unsqueeze(-1)
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
     rays_o = camera_pose[:3,-1].expand(rays_d.shape)
-    return rays_o, rays_d
+    return rays_o.to(device), rays_d.to(device)
 
 
 
@@ -243,20 +255,25 @@ if __name__ == "__main__":
     import numpy as np 
     import matplotlib.pyplot
 
-    from tiny_nerf_dataset import TinyNerfDataset
+    from tiny_nerf_dataset import TinyNerfDataset, TinyNerfImageDataset
     from torch.utils.data import DataLoader
     import pytorch_lightning as pl
     from pytorch_lightning.loggers import WandbLogger
     import torch
     from nerf import NeRF
 
-    logger = WandbLogger(project="test")
+    logger = WandbLogger(project="test",mode="online")
     dataset  = TinyNerfDataset()
-    dataloader = DataLoader(dataset,batch_size=4096,shuffle=False)
+    dataloader = DataLoader(dataset,batch_size=4096,shuffle=True)
+
+    val_dataset =  TinyNerfImageDataset(indices=[0,10,20,30])
+    val_dataloader = DataLoader(val_dataset,batch_size=1,shuffle=False)
+
+
     nerf = NeRF()
     logger.watch(nerf,log_freq=1)
-    trainer = pl.Trainer(max_epochs=50,gpus=1,limit_train_batches=30,logger=logger,log_every_n_steps=1)
-    trainer.fit(nerf,dataloader)
+    trainer = pl.Trainer(max_epochs=50,gpus=1,logger=logger,log_every_n_steps=1)
+    trainer.fit(nerf,dataloader,val_dataloader)
 
     # batch = next(iter(dataloader))
     # rays_o, rays_d, pixels = batch 

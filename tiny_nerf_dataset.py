@@ -3,6 +3,32 @@ from torch.utils.data import Dataset
 import numpy as np
 from nerf import get_image_rays
 
+class TinyNerfImageDataset(Dataset):
+    def __init__(self, indices = None,path = 'minimal-nerf/tiny_nerf_data.npz') -> None:
+        super().__init__()
+        data = np.load(path)
+
+        self.images = data['images']
+        self.poses = torch.tensor(data['poses'])
+
+        if indices:
+            assert isinstance(indices,list)
+            assert max(indices) < len(self.images)
+            assert min(indices) >= 0
+            self.images = self.images[indices]
+            self.poses = self.poses[indices]
+
+        self.focal = data['focal']
+        self.H, self.W = self.images.shape[1:3]
+    
+    def __getitem__(self, idx):
+        return self.images[idx],self.poses[idx],self.focal
+
+    def __len__(self):
+        return len(self.images)
+
+
+    
 class TinyNerfDataset(Dataset):
     def __init__(self,path = 'minimal-nerf/tiny_nerf_data.npz') -> None:
         super().__init__()
@@ -45,3 +71,6 @@ if __name__ == "__main__":
     print(d)
     print(p)
 
+    im_dataset = TinyNerfImageDataset(indices= [0,10,20,30])
+    print(len(im_dataset))
+    im_dataset[0]
