@@ -23,10 +23,10 @@ class NeRFNetwork(nn.Module):
     def add_model_argparse_args(parent_parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         parser = parent_parser.add_argument_group("NerfNetwork")
         parser.add_argument(
-            "--depth", help="number of layers from position to the feature vector and density layer", type=int
+            "--depth", help="number of layers from position to the feature vector and density layer", type=int, default  =8
         )
         parser.add_argument(
-            "--width", help="width of the layers from the position to the feature vector and density layer", type=int
+            "--width", help="width of the layers from the position to the feature vector and density layer", type=int, default  =256
         )
         parser.add_argument(
             "--use_skip_connection",
@@ -49,6 +49,13 @@ class NeRFNetwork(nn.Module):
 
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
+
+        # paper uses relu for activation of the density 
+        # but I have had issues with vanishing gradients and all-black renders which seemingly are caused 
+        # by the densities moving below zero and hence losing their gradients. 
+        # softplus is differentiable everywhere. 
+        # cf. https://github.com/sxyu/pixel-nerf/issues/15#issuecomment-812947300 
+        self.softplus = nn.Softplus()
 
         self.feature_layers = nn.ModuleList([nn.Linear(3, self.width)])
         for i in range(self.depth - 1):
@@ -81,7 +88,7 @@ class NeRFNetwork(nn.Module):
             x = self.relu(x)
 
         density = self.density_head(x)
-        density = self.relu(density)  # constrain to [0, Inf.]
+        density = self.softplus(density)  # constrain to [0, Inf.]
 
         features = self.feature_head(x)
         features = self.relu(features)
@@ -109,21 +116,29 @@ class NeRF(pl.LightningModule):
             "--n_coarse_samples",
             help="number of coarse samples to take for each ray that needs to be rendered. More will result in more accurate renders but results in slower rendering.",
             type=int,
+            default = 64
         )
         parser.add_argument(
             "--min_render_distance",
             help="minimal rendering distance for each ray. important to configre this correctly",
             type=float,
+            defaul= 2.0
         )
         parser.add_argument(
             "--max_render_distance",
             help="maximal rendering distance for each ray. Important to configure this correctly.",
             type=float,
+            default = 6.0
         )
         parser.add_argument(
             "--debug",
             help="log debug information such as model gradients and rendering steps ",
             action=argparse.BooleanOptionalAction,
+        )
+        parser.add_argument(
+            "--not_use_ray_samples_uniform_noise",
+            help="do not use random noise on the sampling bins for the ray rendering samples",
+            action=argparse.BooleanOptionalAction
         )
 
         parser = NeRFNetwork.add_model_argparse_args(parser)
@@ -135,14 +150,16 @@ class NeRF(pl.LightningModule):
         min_render_distance: float = 2.0,
         max_render_distance: float = 6.0,
         n_coarse_samples: int = 64,
+        not_use_ray_samples_uniform_noise: bool = False,
         debug: bool = False,
         **kwargs,
     ) -> None:
         self.debug = debug
+        self.not_use_ray_samples_uniform_noise = not_use_ray_samples_uniform_noise
 
         super().__init__()
 
-        # self.save_hyperparameters()
+        self.save_hyperparameters()
 
         self.mse = nn.MSELoss()
 
@@ -236,11 +253,13 @@ class NeRF(pl.LightningModule):
             self.min_render_distance, self.max_render_distance, steps=n_coarse_samples + 1, device=self.device
         )
         bin_width = (self.max_render_distance - self.min_render_distance) / n_coarse_samples
-        uniform_bin_samples = torch.rand(ray_origins.shape[0], n_coarse_samples, device=self.device)
+        uniform_bin_samples = torch.rand((ray_origins.shape[0], n_coarse_samples,1), device=self.device)
         uniform_bin_samples *= bin_width
-        z_sample_points = (
-            bins[:-1].unsqueeze(0).unsqueeze(-1).expand(ray_directions.shape[0], -1, -1)
-        )  # + uniform_bin_samples
+        expanded_bins = bins[:-1].unsqueeze(0).unsqueeze(-1).expand(ray_directions.shape[0], -1, -1)
+        z_sample_points = expanded_bins
+
+        if not self.not_use_ray_samples_uniform_noise:
+            z_sample_points = z_sample_points + uniform_bin_samples
 
         expanded_ray_directions = ray_directions.unsqueeze(1).expand(
             -1, n_coarse_samples, -1
@@ -264,7 +283,7 @@ class NeRF(pl.LightningModule):
             _type_: _description_
         """
         queried_densities = (
-            queried_densities  # TODO: check if random noise helps? +  torch.randn_like(queried_densities) * 0.01
+            queried_densities  # TODO: check if random noise helps to avoid gradient issues?+  torch.randn_like(queried_densities) * 0.01
         )
         queried_densities = self.nerf.relu(queried_densities)
 
