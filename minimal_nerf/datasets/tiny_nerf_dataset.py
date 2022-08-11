@@ -1,15 +1,22 @@
 import torch 
 from torch.utils.data import Dataset
 import numpy as np
-from nerf import get_image_rays
+from minimal_nerf.nerf import get_image_rays
+from pathlib import Path
 
+def load_tiny_data():
+    path = Path(__file__).parent/"tiny_nerf_data.npz"
+    data = np.load(path)
+    return data
 class TinyNerfImageDataset(Dataset):
-    def __init__(self, indices = None,path = 'minimal-nerf/tiny_nerf_data.npz') -> None:
-        super().__init__()
-        data = np.load(path)
+    def __init__(self, indices = None) -> None:
 
+    
+        super().__init__()
+        data = load_tiny_data()
         self.images = data['images']
         self.poses = torch.tensor(data['poses'])
+        self.focal = data['focal']
 
         if indices:
             assert isinstance(indices,list)
@@ -18,7 +25,6 @@ class TinyNerfImageDataset(Dataset):
             self.images = self.images[indices]
             self.poses = self.poses[indices]
 
-        self.focal = data['focal']
         self.H, self.W = self.images.shape[1:3]
     
     def __getitem__(self, idx):
@@ -30,9 +36,10 @@ class TinyNerfImageDataset(Dataset):
 
     
 class TinyNerfDataset(Dataset):
-    def __init__(self,path = 'minimal-nerf/tiny_nerf_data.npz') -> None:
+    def __init__(self) -> None:
         super().__init__()
-        data = np.load(path)
+
+        data = load_tiny_data()
         self.images = data['images']
         self.poses = torch.tensor(data['poses'])
         self.focal = data['focal']
