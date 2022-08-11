@@ -1,16 +1,16 @@
 import inspect
-from typing import Optional, Tuple
+from argparse import ArgumentParser
 
 import pytorch_lightning as pl
-import torch
+import wandb
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import  ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
-from minimal_nerf.nerf import NeRF
-from minimal_nerf.datasets.tiny_nerf_dataset import TinyNerfDataset, TinyNerfImageDataset
 from torch.utils.data import DataLoader
-from argparse import ArgumentParser
-import wandb 
+
+from minimal_nerf.datasets.tiny_nerf_dataset import TinyNerfDataset, TinyNerfImageDataset
+from minimal_nerf.nerf import NeRF
+
 
 def create_pl_trainer(hparams: dict, wandb_logger: WandbLogger) -> Trainer:
     """
@@ -26,21 +26,21 @@ def create_pl_trainer(hparams: dict, wandb_logger: WandbLogger) -> Trainer:
 
     checkpoint_callback = ModelCheckpoint(monitor="train/loss", mode="min")
 
-    trainer = pl.Trainer(**trainer_kwargs, callbacks=[ checkpoint_callback])
+    trainer = pl.Trainer(**trainer_kwargs, callbacks=[checkpoint_callback])
     return trainer
 
-if __name__ == "__main__":
-    dataset  = TinyNerfDataset()
-    dataloader = DataLoader(dataset,batch_size=4096,shuffle=True)
 
-    val_dataset =  TinyNerfImageDataset(indices=[0,10,20,30])
-    val_dataloader = DataLoader(val_dataset,batch_size=1,shuffle=False)
+if __name__ == "__main__":
+    dataset = TinyNerfDataset()
+    dataloader = DataLoader(dataset, batch_size=4096, shuffle=True)
+
+    val_dataset = TinyNerfImageDataset(indices=[0, 10, 20, 30])
+    val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False)
 
     # create the parser, add module arguments and the system arguments
     parser = ArgumentParser()
     parser = NeRF.add_model_argparse_args(parser)
     parser = Trainer.add_argparse_args(parser)
-
 
     # get parser arguments and filter the specified arguments
     hparams = vars(parser.parse_args())
@@ -57,15 +57,14 @@ if __name__ == "__main__":
         config=hparams,
     )
 
-
     # get (possibly updated by sweep) config parameters
     hparams = wandb.config
     print(f" config after wandb init: {hparams}")
 
     print("starting training")
 
-    logger = WandbLogger() # takes values from current wand session ^
+    logger = WandbLogger()  # takes values from current wand session ^
     pl.seed_everything(2023)
     nerf = NeRF(**hparams)
     trainer = create_pl_trainer(hparams, logger)
-    trainer.fit(nerf,dataloader,val_dataloader)
+    trainer.fit(nerf, dataloader, val_dataloader)
