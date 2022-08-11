@@ -36,11 +36,12 @@ class TinyNerfDataset(Dataset):
     def __len__(self):
         return len(self.pixels)
 
-    def getimage(self,idx):
-        assert idx < len(self.images)
-        return self.images[idx]
 
 
 if __name__ == "__main__":
     dataset = TinyNerfDataset()
+    o,d,p = dataset[0]
+    print(o)
+    print(d)
+    print(p)
 

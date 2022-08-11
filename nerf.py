@@ -1,13 +1,16 @@
 from dis import dis
+from turtle import distance
 from typing import Tuple
+from unittest import TestResult
 import torch.nn as nn
 import torch
 import pytorch_lightning as pl
 import numpy as np
 import torch.random 
+import wandb 
 
 class NeRFNetwork(nn.Module):
-    def __init__(self, depth=8, width=256, skips=[4]):
+    def __init__(self, depth=2, width=256, skips=[]):
         super().__init__()
         self.depth = depth
         self.width = width 
@@ -16,23 +19,24 @@ class NeRFNetwork(nn.Module):
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
 
-        self.encoding = nn.ModuleList([nn.Linear(3,self.width)])
+        self.feature_layers = nn.ModuleList([nn.Linear(3,self.width)])
         for i in range(self.depth-1):
             depth = i +1
             if depth in self.skips:
-                self.encoding.append(nn.Linear(self.width+3,self.width))
+                self.feature_layers.append(nn.Linear(self.width+3,self.width))
             else:
-                self.encoding.append(nn.Linear(self.width,self.width))
+                self.feature_layers.append(nn.Linear(self.width,self.width))
 
         self.density_head = nn.Linear(self.width,1)
-        self.encoding_head = nn.Linear(self.width,128)
-        self.rgb_head = nn.Linear(128+3,3)
+        self.feature_head = nn.Linear(self.width,self.width)
+        self.rgb_layer = nn.Linear(self.width +3, self.width//2)
+        self.rgb_head = nn.Linear(self.width//2,3)
 
     def forward(self,x):
 
         position, view_direction = torch.split(x,3,dim=-1)
         x = position
-        for i,layer in enumerate(self.encoding):
+        for i,layer in enumerate(self.feature_layers):
             if i in self.skips:
                 x = torch.cat([x,position],dim=-1)
             x = layer(x)
@@ -41,10 +45,12 @@ class NeRFNetwork(nn.Module):
         density = self.density_head(x)
         density = self.relu(density) # constrain to 0- Inf.
 
-        features = self.encoding_head(x)
+        features = self.feature_head(x)
         features = self.relu(features)
 
         x = torch.cat([features, view_direction],dim=-1)
+        x = self.rgb_layer(x)
+        x = self.relu(x)
         rgb = self.rgb_head(x)
         rgb = self.sigmoid(rgb) # constrain to 0-1
 
@@ -57,9 +63,9 @@ class NeRF(pl.LightningModule):
         self.mse = nn.MSELoss()
 
 
-        #todo: get these from colmap?
-        self.min_render_distance = 0.0
-        self.max_render_distance = 1.0
+        #TODO: get these from colmap?
+        self.min_render_distance = 2.0
+        self.max_render_distance = 6.0
 
         self.n_coarse_samples = 64
         self.nerf = NeRFNetwork()
@@ -68,16 +74,20 @@ class NeRF(pl.LightningModule):
         return self.nerf(x)
 
     
-    def render_view(self,camera_pose, height, width,intrinsics_matrix, n_coarse_samples):
-        pass
+    def render_view(self,camera_pose, height, width,focal_distance):
+        rays_origin, rays_direction = get_image_rays(camera_pose,height,width,focal_distance, device=self.device)
+        rendered_rgbs = self.render_rays(rays_origin.flatten(),rays_direction.flatten(),self.n_coarse_samples)
+        rendered_img = rendered_rgbs.reshape(rays_origin.shape)
+        return rendered_img
+
 
     def render_rays(self,ray_origins, ray_directions, n_coarse_samples):
 
-        network_query_points = self._compute_query_points(ray_origins,ray_directions,n_coarse_samples)
+        network_query_points, z_sample_points = self._compute_query_points(ray_origins,ray_directions,n_coarse_samples)
         network_query_inputs = torch.cat([network_query_points, ray_directions.unsqueeze(1).expand(-1,n_coarse_samples,-1)],dim=-1)
         queried_rgbs, queried_densities = self.forward(network_query_inputs)
 
-        rendered_rgbs = self._volume_render_rays(network_query_points,queried_rgbs, queried_densities)
+        rendered_rgbs = self._volume_render_rays(z_sample_points,queried_rgbs, queried_densities)
 
         return rendered_rgbs 
 
@@ -90,42 +100,69 @@ class NeRF(pl.LightningModule):
             n_coarse_samples (_type_): 
 
         Returns:
-            n_rays x n_coarse_samples x 3
+            query point: n_rays x n_coarse_samples x 3
+            z_distances: n_rays x n_coarse_samples x 1 
         """
         bins = torch.linspace(self.min_render_distance, self.max_render_distance,steps =n_coarse_samples +1,device=self.device)
         bin_width = (self.max_render_distance-self.min_render_distance)/n_coarse_samples
         uniform_bin_samples = torch.rand(ray_origins.shape[0],n_coarse_samples,device=self.device) 
         uniform_bin_samples *= bin_width
-        samples = bins[:-1] + uniform_bin_samples
+        z_sample_points = bins[:-1].unsqueeze(0).unsqueeze(-1).expand(ray_directions.shape[0],-1,-1) #+ uniform_bin_samples
 
         
         expanded_ray_directions = ray_directions.unsqueeze(1).expand(-1,n_coarse_samples,-1) # (N_rays x N_samples x 3)
-        query_points = ray_origins.unsqueeze(1) + expanded_ray_directions * samples.unsqueeze(2) # autocasted to ^
-        return query_points
+        query_points = ray_origins.unsqueeze(1) + expanded_ray_directions * z_sample_points
+        return query_points, z_sample_points
 
-    def _volume_render_rays(self, queried_points, queried_rgbs, queried_densities):
-        
-        distances = self.compute_adjacent_distances(queried_points)
-        neg_weighted_densities = - distances * queried_densities
-        accumulated_transmittances = torch.exp(torch.cumsum(neg_weighted_densities,dim=-1))
+    def _volume_render_rays(self, z_sample_points, queried_rgbs, queried_densities):
+        """_summary_
 
-        weights = (1- torch.exp(-distances * queried_densities)) * accumulated_transmittances
+        Args:
+            z_sample_points (_type_): N_rays x N_samples x 1
+            queried_rgbs (_type_): N_rays x N_samples x 3
+            queried_densities (_type_): N_rays x N_samples x 1
 
+        Returns:
+            _type_: _description_
+        """
+        queried_densities = queried_densities #TODO: check if random noise helps? +  torch.randn_like(queried_densities) * 0.01
+        queried_densities = self.nerf.relu(queried_densities)
+        distances = self.compute_adjacent_distances(z_sample_points)
+        neg_weighted_densities = - distances * queried_densities + 1e-10
+        zeros_shape = (neg_weighted_densities.shape[0],1,1)
+        transmittances = torch.cat([torch.zeros(zeros_shape,device=self.device),neg_weighted_densities],dim=-2)[:,:-1,:]
+        accumulated_transmittances = torch.exp(torch.cumsum(transmittances,dim=-2))
+        alpha = (1- torch.exp(neg_weighted_densities))
+        weights = alpha * accumulated_transmittances
         rgbs = torch.sum(weights * queried_rgbs, dim = -2)
+
+        if self.logger:
+            wandb.log({
+                "debug/queried_densities":wandb.Histogram(queried_densities.detach().cpu().numpy()),
+                "debug/queried_rgbs": wandb.Histogram(queried_rgbs.detach().cpu().numpy()),
+                "debug/alpha": wandb.Histogram(alpha.detach().cpu().numpy()),
+                "debug/accum_transmittances": wandb.Histogram(accumulated_transmittances.detach().cpu().numpy()),
+                "debug/distances": wandb.Histogram(distances.detach().cpu().numpy()),
+                "debug/rendered_rgbs": wandb.Histogram(rgbs.detach().cpu().numpy()),
+
+        
+
+                })
         return rgbs
         
 
-    def compute_adjacent_distances(self,query_points: torch.Tensor) -> torch.Tensor:
+    def compute_adjacent_distances(self,z_sample_points: torch.Tensor) -> torch.Tensor:
         """computes adjacent value distances for each sample. Adds epsilon distance for the last sample.
 
         Args:
-            query_points (_type_): N_rays x N_samples x 3 tensor
+            z_distances (_type_): N_rays x N_samples x 1 tensor
 
         Returns:
             distances N_rays x N_samples x 1 tensor
         """
-        distances = torch.linalg.norm(query_points[:, 1:,:] - query_points[:,:-1,:],axis=-1)
-        eps_distances_for_final_sample = torch.ones((query_points.shape[0],1),device=self.device)*1e-10
+        z_sample_points = z_sample_points.squeeze(-1)
+        distances = z_sample_points[:, 1:] - z_sample_points[:,:-1]
+        eps_distances_for_final_sample = torch.ones((z_sample_points.shape[0],1),device=self.device)*1e10
         distances = torch.cat([distances,eps_distances_for_final_sample], dim =-1)
         return distances.unsqueeze(-1)
 
@@ -135,17 +172,20 @@ class NeRF(pl.LightningModule):
         rgb_values = self.render_rays(ray_origins, ray_directions,self.n_coarse_samples)
 
         loss = self.mse(rgb_values,rgb_targets)
-        psnr = -10.0 * torch.log(loss) / torch.log(10.0)
+        psnr = -10.0 * torch.log(loss) / torch.log(torch.tensor([10.0],device=self.device))
         self.log("train/loss",loss)
         self.log("train/psnr", psnr)
-        return loss 
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        pass
 
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(),lr=4e-4)
 
 
-def get_image_rays(camera_pose: torch.Tensor, H:int, W:int, focal_distance:float) -> Tuple[torch.Tensor, torch.Tensor]:
+def get_image_rays(camera_pose: torch.Tensor, H:int, W:int, focal_distance:float, device="cpu") -> Tuple[torch.Tensor, torch.Tensor]:
     """    Get the rays for each pixel in an image, assuming a perfect pinhole camera.
 
 
@@ -167,40 +207,67 @@ def get_image_rays(camera_pose: torch.Tensor, H:int, W:int, focal_distance:float
     dirs = torch.stack([(i-W//2)/focal_distance, -(j-H//2)/focal_distance, -torch.ones_like(i)], -1)
     # Rotate ray directions from camera frame to the world frame
     rays_d = torch.sum(dirs[..., np.newaxis, :] * camera_pose[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
+    # make sure all rays are normalized!
+    direction_norm = torch.linalg.norm(rays_d, dim=-1) 
+    rays_d = rays_d / direction_norm.unsqueeze(-1)
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
     rays_o = camera_pose[:3,-1].expand(rays_d.shape)
     return rays_o, rays_d
 
 
+
+
+def test_rendering():
+    from run_nerf import raw2outputs
+    n = 2
+    samples = 3
+    z_vals = torch.rand(n,samples)
+    network_output = torch.rand(n,samples,4)
+    rgb = network_output[...,:3]
+    density = network_output[...,3].unsqueeze(-1)
+
+    rays_d = torch.rand(n,3) 
+    rays_d = rays_d / torch.linalg.norm(rays_d, dim = -1).unsqueeze(-1)
+
+    rgb_theirs,*_ = raw2outputs(network_output,z_vals,rays_d)
+
+    nerf = NeRF()
+    rgb_mine = nerf._volume_render_rays(z_vals,rgb,density)
+    print("rendering difference")
+    print(rgb_mine-rgb_theirs)
+
 if __name__ == "__main__":
     # nerf = NeRF()
     #nerf.render_rays(np.zeros((3,3)),None,10)
 
-    nerf = NeRFNetwork()
-    x = torch.rand(4,6)
-    y = torch.rand(4,1)
-    optimizer = torch.optim.Adam(nerf.parameters(),lr=3e-4)
-    for _ in range(30):
-        yhat=nerf(x)[0]
-        loss = torch.mean((y-yhat)**2)
-        print(loss)
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+    import numpy as np 
+    import matplotlib.pyplot
+
+    from tiny_nerf_dataset import TinyNerfDataset
+    from torch.utils.data import DataLoader
+    import pytorch_lightning as pl
+    from pytorch_lightning.loggers import WandbLogger
+    import torch
+    from nerf import NeRF
+
+    logger = WandbLogger(project="test")
+    dataset  = TinyNerfDataset()
+    dataloader = DataLoader(dataset,batch_size=4096,shuffle=False)
+    nerf = NeRF()
+    logger.watch(nerf,log_freq=1)
+    trainer = pl.Trainer(max_epochs=50,gpus=1,limit_train_batches=30,logger=logger,log_every_n_steps=1)
+    trainer.fit(nerf,dataloader)
+
+    # batch = next(iter(dataloader))
+    # rays_o, rays_d, pixels = batch 
+    # optimizer = torch.optim.Adam(nerf.parameters(),lr=3e-4)
+    # for _ in range(10):
+    #    loss = nerf.training_step(batch,0)
+    #    print(loss)
+    #    loss.backward()
+    #    print(nerf.nerf.rgb_head.bias.grad)
+    #    optimizer.step()
+    #    optimizer.zero_grad()
 
 
-    nerf = NeRFNetwork()
-    x = torch.rand(4,6)
-    y = torch.rand(4,1)
-    optimizer = torch.optim.Adam(nerf.parameters(),lr=3e-4)
-    for _ in range(30):
-        yhat=nerf(x)[0]
-        loss = torch.mean((y-yhat)**2)
-        print(loss)
-        loss.backward()
-
-        print(f"grad={nerf.rgb_head.bias.grad}")
-        optimizer.step()
-        optimizer.zero_grad()
-
-    
+    #test_rendering()
