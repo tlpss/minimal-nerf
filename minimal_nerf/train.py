@@ -1,5 +1,7 @@
 import inspect
+import os
 from argparse import ArgumentParser
+from pathlib import Path
 
 import pytorch_lightning as pl
 import wandb
@@ -52,10 +54,10 @@ if __name__ == "__main__":
     # with sweeps, wandb will send hyperparameters to the current agent after the init
     # these can then be found in the 'config'
     # (so wandb params > argparse)
-    wandb.init(
-        project="nerf-hackathon",
-        config=hparams,
-    )
+    log_dir = Path(__file__).parents[1] / "logging"
+    if not os.path.exists(str(log_dir)):
+        log_dir.mkdir()
+    wandb.init(project="nerf-hackathon", config=hparams, dir=str(log_dir))
 
     # get (possibly updated by sweep) config parameters
     hparams = wandb.config
@@ -63,7 +65,7 @@ if __name__ == "__main__":
 
     print("starting training")
 
-    logger = WandbLogger()  # takes values from current wand session ^
+    logger = WandbLogger(save_dir=str(log_dir))  # takes values from current wand session ^
     pl.seed_everything(2023)
     nerf = NeRF(**hparams)
     trainer = create_pl_trainer(hparams, logger)

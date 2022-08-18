@@ -1,6 +1,8 @@
 import argparse
+import math
 from typing import Tuple
 
+import imageio
 import numpy as np
 import pytorch_lightning as pl
 import torch
@@ -8,6 +10,24 @@ import torch.nn as nn
 import torch.random
 import wandb
 from pytorch_lightning.loggers import WandbLogger
+
+from minimal_nerf.utils import get_spherical_poses
+
+
+class PositionalEncoder(nn.Module):
+    def __init__(self, N: int = 4):
+        super().__init__()
+        self.N = N
+
+    def forward(self, x):
+        encoding = [x]
+        for i in range(self.N):
+            # paper uses scaling with Pi but claims the poses are normalized between -1 and 1,
+            # which is not the case for the tiny dataset
+            # TODO: with Colmap datasets -> how to bring them in the appropriate range?
+            encoding.extend([torch.sin(2.0**i * x), torch.cos(2.0**i * x)])
+
+        return torch.concat(encoding, dim=-1)
 
 
 class NeRFNetwork(nn.Module):
@@ -23,25 +43,33 @@ class NeRFNetwork(nn.Module):
     def add_model_argparse_args(parent_parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         parser = parent_parser.add_argument_group("NerfNetwork")
         parser.add_argument(
-            "--depth", help="number of layers from position to the feature vector and density layer", type=int, default  =8
+            "--depth",
+            help="number of layers from position to the feature vector and density layer",
+            type=int,
+            default=4,
         )
         parser.add_argument(
-            "--width", help="width of the layers from the position to the feature vector and density layer", type=int, default  =256
+            "--width",
+            help="width of the layers from the position to the feature vector and density layer",
+            type=int,
+            default=128,
         )
         parser.add_argument(
             "--use_skip_connection",
             help="Use a skip connection halfway through the layers between position and density/feature vector",
             action=argparse.BooleanOptionalAction,
         )
+        parser.add_argument("--n_positional_encodings", default=4)
         return parent_parser
 
-    def __init__(self, depth=4, width=128, use_skip_connection: bool = True, **kwargs):
+    def __init__(self, depth=4, width=128, n_positional_encodings=4, use_skip_connection: bool = False, **kwargs):
 
         super().__init__()
         assert depth % 2 == 0, "depth should be even"
 
         self.depth = depth
         self.width = width
+        self.n_positional_encodings = n_positional_encodings
         if use_skip_connection:
             self.skips = [depth // 2]  # lazy
         else:
@@ -50,24 +78,27 @@ class NeRFNetwork(nn.Module):
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
 
-        # paper uses relu for activation of the density 
-        # but I have had issues with vanishing gradients and all-black renders which seemingly are caused 
-        # by the densities moving below zero and hence losing their gradients. 
-        # softplus is differentiable everywhere. 
-        # cf. https://github.com/sxyu/pixel-nerf/issues/15#issuecomment-812947300 
+        # paper uses relu for activation of the density
+        # but I have had issues with vanishing gradients and all-black renders which seemingly are caused
+        # by the densities moving below zero and hence losing their gradients.
+        # softplus is differentiable everywhere.
+        # cf. https://github.com/sxyu/pixel-nerf/issues/15#issuecomment-812947300
         self.softplus = nn.Softplus()
 
-        self.feature_layers = nn.ModuleList([nn.Linear(3, self.width)])
+        input_dim = 3 + 2 * 3 * self.n_positional_encodings
+        self.positional_encoding = PositionalEncoder(self.n_positional_encodings)
+        self.feature_layers = nn.ModuleList([nn.Linear(input_dim, self.width)])
+
         for i in range(self.depth - 1):
             depth = i + 1
             if depth in self.skips:
-                self.feature_layers.append(nn.Linear(self.width + 3, self.width))
+                self.feature_layers.append(nn.Linear(self.width + input_dim, self.width))
             else:
                 self.feature_layers.append(nn.Linear(self.width, self.width))
 
         self.density_head = nn.Linear(self.width, 1)
         self.feature_head = nn.Linear(self.width, self.width)
-        self.rgb_layer = nn.Linear(self.width + 3, self.width // 2)
+        self.rgb_layer = nn.Linear(self.width + input_dim, self.width // 2)
         self.rgb_head = nn.Linear(self.width // 2, 3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -80,6 +111,7 @@ class NeRFNetwork(nn.Module):
         """
 
         position, view_direction = torch.split(x, 3, dim=-1)
+        position, view_direction = self.positional_encoding(position), self.positional_encoding(view_direction)
         x = position
         for i, layer in enumerate(self.feature_layers):
             if i in self.skips:
@@ -116,19 +148,19 @@ class NeRF(pl.LightningModule):
             "--n_coarse_samples",
             help="number of coarse samples to take for each ray that needs to be rendered. More will result in more accurate renders but results in slower rendering.",
             type=int,
-            default = 64
+            default=64,
         )
         parser.add_argument(
             "--min_render_distance",
             help="minimal rendering distance for each ray. important to configre this correctly",
             type=float,
-            defaul= 2.0
+            default=2.0,
         )
         parser.add_argument(
             "--max_render_distance",
             help="maximal rendering distance for each ray. Important to configure this correctly.",
             type=float,
-            default = 6.0
+            default=6.0,
         )
         parser.add_argument(
             "--debug",
@@ -138,7 +170,7 @@ class NeRF(pl.LightningModule):
         parser.add_argument(
             "--not_use_ray_samples_uniform_noise",
             help="do not use random noise on the sampling bins for the ray rendering samples",
-            action=argparse.BooleanOptionalAction
+            action=argparse.BooleanOptionalAction,
         )
 
         parser = NeRFNetwork.add_model_argparse_args(parser)
@@ -159,8 +191,6 @@ class NeRF(pl.LightningModule):
 
         super().__init__()
 
-        self.save_hyperparameters()
-
         self.mse = nn.MSELoss()
 
         # TODO: get these from colmap?
@@ -174,10 +204,29 @@ class NeRF(pl.LightningModule):
             # log gradients
             self.logger.watch(self.nerf, log_freq=10)
 
-        # self.save_hyperparameters()
+        self.save_hyperparameters()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.nerf(x)
+
+    def render_spherical_video(
+        self,
+        path,
+        radius: float,
+        focal_distance: float,
+        height: int,
+        width: int,
+        phi_range: float = 2 * math.pi,
+        steps: int = 120,
+    ):
+        views = []
+        with torch.no_grad():
+            for pose in get_spherical_poses(radius, phi_range, steps):
+                pose = pose.to(self.device)
+                view = self.render_view(pose, height, width, focal_distance)
+                views.append((view.cpu().numpy() * 255).astype(np.uint8))
+
+        imageio.v2.mimwrite(path, views, fps=30, quality=7)
 
     def render_view(self, camera_pose: torch.Tensor, height: int, width: int, focal_distance: float) -> torch.Tensor:
         """Renders a view using a pinhole camera model with the specified camera pose, image dimensions and focal distance.
@@ -253,7 +302,7 @@ class NeRF(pl.LightningModule):
             self.min_render_distance, self.max_render_distance, steps=n_coarse_samples + 1, device=self.device
         )
         bin_width = (self.max_render_distance - self.min_render_distance) / n_coarse_samples
-        uniform_bin_samples = torch.rand((ray_origins.shape[0], n_coarse_samples,1), device=self.device)
+        uniform_bin_samples = torch.rand((ray_origins.shape[0], n_coarse_samples, 1), device=self.device)
         uniform_bin_samples *= bin_width
         expanded_bins = bins[:-1].unsqueeze(0).unsqueeze(-1).expand(ray_directions.shape[0], -1, -1)
         z_sample_points = expanded_bins
@@ -282,15 +331,14 @@ class NeRF(pl.LightningModule):
         Returns:
             _type_: _description_
         """
-        queried_densities = (
-            queried_densities  # TODO: check if random noise helps to avoid gradient issues?+  torch.randn_like(queried_densities) * 0.01
-        )
+        queried_densities = queried_densities  # TODO: check if random noise helps to avoid gradient issues?+  torch.randn_like(queried_densities) * 0.01
         queried_densities = self.nerf.relu(queried_densities)
 
         distances = self._compute_adjacent_distances(z_sample_points)
 
         neg_weighted_densities = -distances * queried_densities + 1e-10  # eps for numerical stability in exp later on
 
+        # first row of zeros as the first sample cannot have a non-zero transmittance, the ray is always supposed to get there!
         zeros_shape = (neg_weighted_densities.shape[0], 1, 1)
         transmittances = torch.cat([torch.zeros(zeros_shape, device=self.device), neg_weighted_densities], dim=-2)[
             :, :-1, :
@@ -369,15 +417,23 @@ class NeRF(pl.LightningModule):
         focal_length = focal_length.item()
         with torch.no_grad():
             rendered_image = self.render_view(pose, image.shape[0], image.shape[1], focal_length)
+            loss = self.mse(image, rendered_image)
+            psnr = -10.0 * torch.log(loss) / torch.log(torch.tensor([10.0], device=self.device))
             rendered_image = rendered_image.cpu().numpy()
             image = image.cpu().numpy()
+
+        self.log("train/val_images_loss", loss)
+        self.log("train/val_images_psnr", psnr)
 
         if isinstance(self.logger, WandbLogger):
             self.logger.log_image(
                 key=f"train_{batch_idx}", images=[image, rendered_image], caption=["train", "rendered"]
             )
 
-        # TODO: log PSNR/ SSIM / MSE
+        if batch_idx == 0 and self.current_epoch % 1 == 0 and self.current_epoch > 0:
+            self.render_spherical_video(f"video.mp4", 4.0, focal_length, image.shape[0], image.shape[1])
+            if isinstance(self.logger, WandbLogger):
+                wandb.log({"video": wandb.Video("video.mp4", format="mp4")})
 
     def configure_optimizers(self):
         # TODO: introduce scheduler as in paper
