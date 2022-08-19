@@ -430,7 +430,7 @@ class NeRF(pl.LightningModule):
                 key=f"train_{batch_idx}", images=[image, rendered_image], caption=["train", "rendered"]
             )
 
-        if batch_idx == 0 and self.current_epoch % 1 == 0 and self.current_epoch > 0:
+        if batch_idx == 0 and self.current_epoch % 5 == 0 and self.current_epoch > 0:
             self.render_spherical_video(f"video.mp4", 4.0, focal_length, image.shape[0], image.shape[1])
             if isinstance(self.logger, WandbLogger):
                 wandb.log({"video": wandb.Video("video.mp4", format="mp4")})
